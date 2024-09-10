@@ -132,7 +132,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), img_size=336, num_classes=1)
         
-        self.pixel_model_device = torch.device(f"cuda:7")
+        # self.pixel_model_device = torch.device(f"cuda:7")
         ## 下面设置prompt
         ctx_vector_size = (5, 4096)
         ctx_vectors_pos = torch.empty(ctx_vector_size)

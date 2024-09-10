@@ -1,48 +1,3 @@
-from torch import Tensor, nn
-import torch
-from torch.nn import functional as F
-# import open_clip
-import numpy as np
-
-def gray2rgb(gray):
-    rgb = gray.expand(-1, 3, -1, -1)
-    return rgb
-
-class LinearLayer(nn.Module):
-    def __init__(self, dim_in=1024, dim_out=768):
-        super(LinearLayer, self).__init__()
-        # if 'ViT' in model:   ## 1024   
-        # self.fc = nn.ModuleList([nn.Linear(dim_in, dim_out) for i in range(k)])
-        self.fc = nn.Linear(dim_in, dim_out)
-        self.text_features = nn.Parameter(torch.empty(2, 768))
-        # 初始化参数
-        nn.init.xavier_uniform_(self.text_features)
-        # import ssl
-        # ssl._create_default_https_context = ssl._create_unverified_context
-        # model, _, preprocess = open_clip.create_model_and_transforms('ViT-L-14-336', 518, pretrained='openai')
-    def forward(self, img_token):
-        ## 1 * 576 * 1024
-        B = img_token.size(0)
-        patch_features = self.fc(img_token)  
-                # 1. norm
-        patch_features /= patch_features.norm(dim=-1, keepdim=True)
-        text_features = self.text_features.expand(B, -1, -1)
-        # 2. similarity, (1,1369,768)@(1,768,2) => (1,1369,2)
-        similarity = patch_features @ text_features.permute(0, 2, 1)
-        anomaly_map = (100.0 * similarity)  # scaling for soft-max
-        B, L, C = anomaly_map.shape
-        H = int(np.sqrt(L))
-        anomaly_map = anomaly_map.permute(0, 2, 1).view(B, 2, H, H)  # (B,2,37,37)
-
-        # 4. pixel-level, resize anomaly_map, (B,2,37,37) => (B,2,518,518)
-        anomaly_map = F.interpolate(anomaly_map, 336, mode='bilinear', align_corners=True)
-
-        # 5. softmax, crack_prob/[0,1] of each pixel
-        anomaly_map_sm = torch.softmax(anomaly_map, dim=1)
-
-        return anomaly_map_sm
-    
-
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
@@ -63,7 +18,35 @@ import timm.models.vision_transformer
 from einops import rearrange
 import torch.nn.functional as F
 import numpy as np
-    
+import sys
+sys.path.append('/home/data1/zhangzr22/LLaVA_DATA/mae_raw')
+import open_clip
+from prompt_ensemble import AnomalyCLIP_PromptLearner
+from collections import OrderedDict
+
+def interpolate_pos_embed(model, checkpoint_model):
+    if 'pos_embed' in checkpoint_model:
+        pos_embed_checkpoint = checkpoint_model['pos_embed']
+        embedding_size = pos_embed_checkpoint.shape[-1]   #768
+        num_patches = model.patch_embed.num_patches   #32*32=1024
+        num_extra_tokens = model.pos_embed.shape[-2] - num_patches #1
+        # height (== width) for the checkpoint position embedding
+        orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5) #14
+        # height (== width) for the new position embedding
+        new_size = int(num_patches ** 0.5) #32
+        # class_token and dist_token are kept unchanged
+        if orig_size != new_size:
+            print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
+            extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]  #1, 1, 768
+            # only the position tokens are interpolated
+            pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:] #1, 196, 768
+            pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)  # 1, 768, 14, 14
+            pos_tokens = torch.nn.functional.interpolate(
+                pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False) # 1, 768, 32, 32
+            pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2) #1,1024,768
+            new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+            checkpoint_model['pos_embed'] = new_pos_embed
+
 
 def rgb2gray(rgb):
     b, g, r = rgb[:, 0, :, :], rgb[:, 1, :, :], rgb[:, 2, :, :]
@@ -74,7 +57,6 @@ def rgb2gray(rgb):
 
 class BayarConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=5, stride=1, padding=0):
-        super(BayarConv2d, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = kernel_size
@@ -82,9 +64,11 @@ class BayarConv2d(nn.Module):
         self.padding = padding
         self.minus1 = (torch.ones(self.in_channels, self.out_channels, 1) * -1.000)
 
+        super(BayarConv2d, self).__init__()
         # only (kernel_size ** 2 - 1) trainable params as the center element is always -1
         self.kernel = nn.Parameter(torch.rand(self.in_channels, self.out_channels, kernel_size ** 2 - 1),
                                    requires_grad=True)
+
 
     def bayarConstraint(self):
         self.kernel.data = self.kernel.permute(2, 0, 1)
@@ -96,26 +80,20 @@ class BayarConv2d(nn.Module):
         return real_kernel
 
     def forward(self, x):
-        # 将权重张量转换为 float16 类型以匹配输入张量
-        # weight = self.bayarConstraint().to(torch.bfloat16)
-        input_dtype = x.dtype
-    
-        # 将权重张量转换为与输入张量相同的类型
-        weight = self.bayarConstraint().to(input_dtype)
-        x = F.conv2d(x, weight, stride=self.stride, padding=self.padding)
+        x = F.conv2d(x, self.bayarConstraint(), stride=self.stride, padding=self.padding)
         return x
     
-    
+
 class noise_vit_tiny(timm.models.vision_transformer.VisionTransformer):
     def __init__(self, **kwargs):
         super(noise_vit_tiny, self).__init__(**kwargs)
 
         self.img_size = kwargs['img_size']
         self.patch_size = kwargs['patch_size']
-        # num_tokens = (self.img_size // self.patch_size)**2
-        # self.proj = nn.Linear(num_tokens+1, num_tokens)
+        self.load_weight()
 
     def forward(self, x):
+        output = []
         B = x.shape[0]
         x = self.patch_embed(x)
 
@@ -124,19 +102,66 @@ class noise_vit_tiny(timm.models.vision_transformer.VisionTransformer):
 
         x = x + self.pos_embed
         x = self.pos_drop(x)
-
-        for i, blk in enumerate(self.blocks, start=0):
-            x = blk(x)
-       
-        # x = self.proj(x.permute(0,2,1)).permute(0,2,1)
-        x = self.norm(x)
         x_ = x[:, 1:, :]
-        # h, w = self.img_size // self.patch_size, self.img_size // self.patch_size
-        # outcome = rearrange(x_, 'b (h w) c -> b c h w', h=h, w=w)
+        
+        output.append(self.norm(x_))
+        for i, blk in enumerate(self.blocks, start=0):
+            if (i + 1) % 4 ==0:
+                x = blk(x)
+                x_ = x[:, 1:, :]
+                output.append(self.norm(x_))
+            else:
+                x = blk(x)
 
-        return x_
+        return output
+    
+    def load_weight(self):
+        state_dict = torch.load(r'/home/data1/zhangzr22/zfr/mae_raw/mae_tiny_400e.pth.tar')
+        state_dict = state_dict['model']
+        new_state_dict = OrderedDict()
+        for name, params in state_dict.items():
+            new_state_dict[name[13:]] = state_dict[name]
+        interpolate_pos_embed(self, new_state_dict)
+        msg = self.load_state_dict(new_state_dict, strict=False)
+        print(msg)
+        
 
+class ScaledDot_txt(nn.Module):
+    def __init__(self, mask_token=441, mask_value=-1e9):
+        super(ScaledDot_txt, self).__init__()
+        self.mask_value = mask_value
+        self.Q = nn.Parameter(torch.randn(1, mask_token, 2))  # 改为 441 以确保输出维度为 441
+        # self.linear = nn.Linear(mask_token, 441)  # 添加线性变换来调整输出维度
 
+    def forward(self, mask, attn_mask=None):
+        '''
+        Q: [batch_size, 441, d_k]
+        K: [batch_size, len_k, d_k]
+        V: [batch_size, len_v(=len_k), d_v]
+        attn_mask: [batch_size, seq_len, seq_len]
+        '''
+        B = mask.size(0)
+        Q = self.Q.repeat(B, 1, 1)  # 扩展 Q 的形状为 (batch_size, 441, 768)
+        d_k = Q.size(-1)
+
+        # 计算注意力得分
+        scores = torch.matmul(Q, mask.transpose(-1, -2)) / np.sqrt(d_k)  # scores : [batch_size, 441, token]
+
+        if attn_mask is not None:
+            scores.masked_fill_(attn_mask, self.mask_value)
+
+        # 计算注意力权重
+        attn = nn.Softmax(dim=-1)(scores)  # attn : [batch_size, 441, token]
+
+        # # 线性变换将 attn 维度调整到 441
+        # attn = self.linear(attn.transpose(1, 2)).transpose(1, 2)  # attn : [batch_size, 441, token]
+
+        # 计算上下文向量
+        context = torch.matmul(attn, mask)  # [batch_size, 441, 768]
+
+        return context  # 输出维度为 [batch_size, 441, 特征维度]
+    
+    
 class ScaledDotProductAttention(nn.Module):
     def __init__(self, emb_dim=768, mask_value=-1e9):
         super(ScaledDotProductAttention, self).__init__()
@@ -192,12 +217,13 @@ class Noisefusion(nn.Module):
         """
         self.fuse = nn.ModuleList([ScaledDotProductAttention(emb_dim=emb_dim) for i in range(k)])
 
-    def forward(self, image_features, noise_feature):
+    def forward(self, image_features, noise_features):
         """ image_features: list
             noise_feature: [B, L, Embeding]
         """
         fusion = []
         for i, image_feature in enumerate(image_features):
+            noise_feature = noise_features[i]
             tmp_fusion = self.fuse[i](noise_feature, image_feature) # Q: image feature, K\V: noise_feature
             fusion.append(tmp_fusion)
 
@@ -225,7 +251,7 @@ class TextSimilarity(nn.Module):
         return torch.stack(similarity_list, dim=0).mean(dim=0)
 
 class Decoder2D(nn.Module):
-    def __init__(self, in_channels, out_channels, features=[336, 256, 128, 64]):
+    def __init__(self, in_channels, out_channels, features=[512, 256, 128, 64]):
         super().__init__()
         self.decoder_1 = nn.Sequential(
                     nn.Conv2d(in_channels, features[0], 3, padding=1),
@@ -283,42 +309,52 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         embed_dim = kwargs['embed_dim']
         self.img_size = kwargs['img_size']
         self.patch_size = kwargs['patch_size']
-
+        self.feature_list = [6, 12, 18, 24]
         # adjust feature list
-        self.trainable_linearlayer = LinearLayer(embed_dim, embed_dim, 4)
+        self.trainable_linearlayer = LinearLayer(1024, embed_dim, 4)
         self.per_num_tokens = self.img_size // self.patch_size
         # num_tokens = self.per_num_tokens**2
         # self.proj_img = nn.Linear(num_tokens+1, num_tokens)
         
         # noise
-        self.constrain_conv = BayarConv2d(in_channels=1, out_channels=3, padding=2)
-        self.noise_vit = noise_vit_tiny(img_size=self.img_size, patch_size=16, embed_dim=embed_dim, depth=4, num_heads=3, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6))
+        # self.constrain_conv = BayarConv2d(in_channels=1, out_channels=3, padding=2)
+        # self.noise_vit = noise_vit_tiny(img_size=self.img_size, patch_size=16, embed_dim=192, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
+        # norm_layer=partial(nn.LayerNorm, eps=1e-6))
         self.noise_fusion = Noisefusion(emb_dim=embed_dim, k=4)
         self.proj = nn.Linear(embed_dim, 2)
 
         # clip
-        # self.clipmodel, _, _ = open_clip.create_model_and_transforms("/root/autodl-tmp/mae/ViT-L-14-336px.pt", self.img_size, pretrained="openai")
-        # self.tokenizer = open_clip.get_tokenizer("/root/autodl-tmp/mae/ViT-L-14-336px.pt")
+        self.clipmodel, _, _ = open_clip.create_model_and_transforms("/home/data1/zhangzr22/LLaVA_DATA/mae_raw_ckpt/ViT-L-14-336px.pt", self.img_size, pretrained="openai")
+        self.tokenizer = open_clip.get_tokenizer("/home/data1/zhangzr22/LLaVA_DATA/mae_raw_ckpt/ViT-L-14-336px.pt")
+        self.prompt_learner = AnomalyCLIP_PromptLearner(self.clipmodel.to("cpu"), self.tokenizer)
+        # 冻结模型的所有参数
+        for param in self.clipmodel.parameters():
+            param.requires_grad = False
+        # 确认模型是否已冻结
+        print("Clip model frozen:", all(not p.requires_grad for p in self.clipmodel.parameters()))
+        # self.tokenizer = open_clip.get_tokenizer("/home/data1/zhangzr22/zfr/VAND-APRIL-LLM-Agent/ViT-L-14-336px.pt")
         # self.prompt_learner = AnomalyCLIP_PromptLearner(self.clipmodel.to("cpu"), self.tokenizer)
-
-        # text
-        ctx_vector_size = (1, 2, embed_dim)
-        ctx_vectors_pos = torch.empty(ctx_vector_size)
-        nn.init.normal_(ctx_vectors_pos, std=0.02) 
-        self.text_embedding = nn.Parameter(ctx_vectors_pos)
+  
         self.text_fusion = TextSimilarity()
+        
         self.decoder = Decoder2D(embed_dim+4, kwargs['num_classes'])
+        
+        self.bceloss = nn.BCEWithLogitsLoss()
 
-    # def forward_txt_features(self):
-    #     self.clipmodel.eval()
-    #     prompts, tokenized_prompts, compound_prompts_text = self.prompt_learner(cls_id = None)
-    #     text_features = self.clipmodel.encode_text_learn(prompts, tokenized_prompts, compound_prompts_text).float()
-    #     text_features = torch.stack(torch.chunk(text_features, dim = 0, chunks = 2), dim = 1)
-    #     text_features = text_features/text_features.norm(dim=-1, keepdim=True)
-    #     print('text_features.shape:', text_features.shape)
+        ### 降低文本特征token
+        self.dot_attention = ScaledDot_txt(mask_token=441)
+        
 
-    #     return text_features
+    def forward_txt_features(self):
+        self.clipmodel.eval()
+        prompts, tokenized_prompts, compound_prompts_text = self.prompt_learner(cls_id = None)
+        text_features = self.clipmodel.encode_text_learn(prompts, tokenized_prompts, compound_prompts_text).float()
+        text_features = torch.stack(torch.chunk(text_features, dim = 0, chunks = 2), dim = 1)
+        text_features = text_features/text_features.norm(dim=-1, keepdim=True)
+        # print('text_features.shape:', text_features.shape)
+        text_features = torch.mean(text_features, dim=0, keepdim=True)
+        return text_features
+        
 
     def forward_features(self, x):
         feature_list = []
@@ -329,12 +365,12 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.pos_embed
         x = self.pos_drop(x)
-        feature_list.append(x)
+        feature_list.append(self.norm(x[:, 1:, :]))
 
         for i, blk in enumerate(self.blocks, start=0):
             if (i + 1) % 4 ==0:
                 x = blk(x)
-                feature_list.append(x)
+                feature_list.append(self.norm(x[:, 1:, :]))
             else:
                 x = blk(x)
         # x = self.proj_img(x.permute(0,2,1)).permute(0,2,1)
@@ -357,25 +393,30 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         return loss
 
     def forward(self, x, gt):
-        # text_feature = self.forward_txt_features()
+        text_feature = self.forward_txt_features().bfloat16()
         input_ = x.clone()
-        input_gray = rgb2gray(input_)
-        noise = self.constrain_conv(input_gray)
-        noise_feature = self.noise_vit(noise)
-
+        # input_gray = rgb2gray(input_)
+        # noise = self.constrain_conv(input_gray)
+        # noise_features = self.noise_vit(noise)
+        with torch.no_grad():
+            noise_image_feature, noise_image_feature_token, noise_feature_list = self.clipmodel.encode_image(input_, self.feature_list)
         image_feature, feature_list = self.forward_features(x)
-        feature_list_modified = self.trainable_linearlayer(feature_list)
-        noise_fusion = self.noise_fusion(feature_list_modified, noise_feature)
+        noise_feature_list_modified = self.trainable_linearlayer(noise_feature_list)
+        noise_fusion = self.noise_fusion(feature_list, noise_feature_list_modified)
         noise_fusion = self.proj(noise_fusion)
-        txt_fusion = self.text_fusion(feature_list_modified, self.text_embedding)
-        # breakpoint()
+        txt_fusion = self.text_fusion(noise_feature_list, text_feature)
+        txt_fusion = self.dot_attention(txt_fusion)
         concat_feature = torch.cat((noise_fusion, image_feature, txt_fusion), dim=-1)  # [1,1024,772]
         concat_feature_ = rearrange(concat_feature, 'b (h w) c -> b c h w', h=self.per_num_tokens, w=self.per_num_tokens)
         out = self.decoder(concat_feature_)
-        pred = torch.sigmoid(out)
-        loss = self.forward_loss(pred, gt)
+        pred_mask = torch.sigmoid(out)
+
+        seg_loss = self.forward_loss(pred_mask, gt)
+        # bce_loss = self.bceloss(out, gt)
+        # loss = 0.8*seg_loss+0.2*bce_loss
+        loss = seg_loss
        
-        return pred, loss
+        return pred_mask, loss
 
 
 def vit_base_patch16(**kwargs):
@@ -400,11 +441,12 @@ def vit_huge_patch14(**kwargs):
 
 
 if __name__ == '__main__':
-    x = torch.randn([1, 3, 336, 336]).cuda().to(torch.bfloat16)
-    gt = torch.randn([1, 1, 336, 336]).cuda().to(torch.bfloat16)
+    x = torch.randn([2, 3, 336, 336]).bfloat16()
+    gt = torch.randn([2, 1, 336, 336]).bfloat16()
+    edge = torch.randn([2, 1, 336, 336]).bfloat16()
     model = VisionTransformer(
         patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), img_size=336, num_classes=1).cuda().to(torch.bfloat16)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), img_size=336, num_classes=1).bfloat16()
     
     y, loss = model(x, gt)
     print(y.shape)

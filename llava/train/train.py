@@ -50,6 +50,29 @@ def direct_val(imgs):
 
 local_rank = None
 
+def interpolate_pos_embed(model, checkpoint_model):
+    if 'pos_embed' in checkpoint_model:
+        pos_embed_checkpoint = checkpoint_model['pos_embed']
+        embedding_size = pos_embed_checkpoint.shape[-1]
+        num_patches = model.patch_embed.num_patches
+        num_extra_tokens = model.pos_embed.shape[-2] - num_patches
+        # height (== width) for the checkpoint position embedding
+        orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
+        # height (== width) for the new position embedding
+        new_size = int(num_patches ** 0.5)
+        # class_token and dist_token are kept unchanged
+        if orig_size != new_size:
+            print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
+            extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+            # only the position tokens are interpolated
+            pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+            pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
+            pos_tokens = torch.nn.functional.interpolate(
+                pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+            pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
+            new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+            checkpoint_model['pos_embed'] = new_pos_embed
+            
 def get_solid_color_image(size, color):
     """生成指定颜色和大小的图片"""
     return Image.fromarray(np.full((size[1], size[0], 3), color, dtype=np.uint8))
@@ -1068,6 +1091,8 @@ def train(attn_implementation=None):
             if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
                 print(f"Removing key {k} from pretrained checkpoint")
                 del checkpoint_model[k]
+        # interpolate position embedding
+        interpolate_pos_embed(model.pixel_model, checkpoint_model)
         model.pixel_model.load_state_dict(checkpoint_model, strict=True)
     else:
     # 检查点模型的状态字典
@@ -1082,7 +1107,8 @@ def train(attn_implementation=None):
                 new_checkpoint_model[new_key] = checkpoint_model[k]
             else:
                 print(f"Skipping loading parameter {k} due to shape mismatch or key not found in model state dict.")
-
+        interpolate_pos_embed(model.pixel_model, checkpoint_model)
+        model.pixel_model.load_state_dict(checkpoint_model, strict=True)
         # 加载状态字典
         model.pixel_model.load_state_dict(new_checkpoint_model, strict=False)
 
@@ -1195,7 +1221,7 @@ def train(attn_implementation=None):
     #     p.data.requires_grad = True
     model.ctx_token.requires_grad = True
     for p in model.pixel_model.parameters():
-        p.requires_grad = training_args.train_pixel_model
+        p.requires_grad = False
     for p in model.pixel_model.decoder.parameters(): ## decoder_1.
         p.requires_grad = training_args.train_pixel_model
     if training_args.bits in [4, 8]:
